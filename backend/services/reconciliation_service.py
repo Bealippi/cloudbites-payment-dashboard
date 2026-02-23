@@ -1,5 +1,8 @@
 import uuid
+import logging
 from datetime import datetime, timezone
+
+from fastapi import HTTPException
 
 from database import get_connection
 from processors.registry import get_processor
@@ -9,6 +12,8 @@ from services.normalization import (
     classify_mismatch,
     get_severity,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def run_reconciliation() -> dict:
@@ -23,7 +28,8 @@ def run_reconciliation() -> dict:
     conn.commit()
 
     rows = conn.execute("""
-        SELECT t.id, t.internal_status, t.processor_transaction_id, p.processor_name
+        SELECT t.id, t.internal_status, t.processor_transaction_id,
+               t.amount, t.currency, p.processor_name
         FROM transactions t
         JOIN payments p ON t.payment_id = p.id
     """).fetchall()
@@ -31,63 +37,106 @@ def run_reconciliation() -> dict:
     total_checked = 0
     mismatches_found = 0
 
-    for row in rows:
-        txn_id = row["id"]
-        internal_status = row["internal_status"]
-        proc_txn_id = row["processor_transaction_id"]
-        proc_name = row["processor_name"]
+    try:
+        for row in rows:
+            txn_id = row["id"]
+            internal_status = row["internal_status"]
+            proc_txn_id = row["processor_transaction_id"]
+            proc_name = row["processor_name"]
 
-        processor = get_processor(proc_name)
-        if processor is None:
-            continue
+            processor = get_processor(proc_name)
+            if processor is None:
+                continue
 
-        total_checked += 1
-        raw_response = processor.get_transaction(proc_txn_id)
+            total_checked += 1
+            raw_response = processor.get_transaction(proc_txn_id)
 
-        if raw_response is None:
-            mismatches_found += 1
-            result_id = str(uuid.uuid4())
-            mismatch_type = classify_mismatch(internal_status, "NOT_FOUND")
-            severity = get_severity(mismatch_type)
-            conn.execute(
-                """INSERT INTO reconciliation_results
-                   (id, run_id, transaction_id, internal_status, processor_raw_status,
-                    processor_normalized_status, mismatch_type, severity, resolved, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)""",
-                (result_id, run_id, txn_id, internal_status, "NOT_FOUND", "NOT_FOUND",
-                 mismatch_type, severity, now),
-            )
-            continue
+            if raw_response is None:
+                mismatches_found += 1
+                result_id = str(uuid.uuid4())
+                mismatch_type = classify_mismatch(internal_status, "NOT_FOUND")
+                severity = get_severity(mismatch_type)
+                conn.execute(
+                    """INSERT INTO reconciliation_results
+                       (id, run_id, transaction_id, internal_status, processor_raw_status,
+                        processor_normalized_status, mismatch_type, severity, resolved, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)""",
+                    (result_id, run_id, txn_id, internal_status, "NOT_FOUND", "NOT_FOUND",
+                     mismatch_type, severity, now),
+                )
+                continue
 
-        normalized = normalize_processor_status(proc_name, raw_response)
-        raw_status = extract_raw_status(proc_name, raw_response)
+            normalized = normalize_processor_status(proc_name, raw_response)
+            raw_status = extract_raw_status(proc_name, raw_response)
 
-        if normalized != internal_status:
-            mismatches_found += 1
-            result_id = str(uuid.uuid4())
-            mismatch_type = classify_mismatch(internal_status, normalized)
-            severity = get_severity(mismatch_type)
-            conn.execute(
-                """INSERT INTO reconciliation_results
-                   (id, run_id, transaction_id, internal_status, processor_raw_status,
-                    processor_normalized_status, mismatch_type, severity, resolved, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)""",
-                (result_id, run_id, txn_id, internal_status, raw_status, normalized,
-                 mismatch_type, severity, now),
-            )
+            # Status mismatch
+            if normalized != internal_status:
+                mismatches_found += 1
+                result_id = str(uuid.uuid4())
+                mismatch_type = classify_mismatch(internal_status, normalized)
+                severity = get_severity(mismatch_type)
+                conn.execute(
+                    """INSERT INTO reconciliation_results
+                       (id, run_id, transaction_id, internal_status, processor_raw_status,
+                        processor_normalized_status, mismatch_type, severity, resolved, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)""",
+                    (result_id, run_id, txn_id, internal_status, raw_status, normalized,
+                     mismatch_type, severity, now),
+                )
 
-    completed_at = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        """UPDATE reconciliation_runs
-           SET completed_at = ?, total_checked = ?, mismatches_found = ?, status = 'COMPLETED'
-           WHERE id = ?""",
-        (completed_at, total_checked, mismatches_found, run_id),
-    )
-    conn.commit()
+            # Amount mismatch detection (cents vs major unit conversion errors)
+            internal_amount = row["amount"]
+            proc_amount = _extract_processor_amount(proc_name, raw_response)
+            if proc_amount is not None and abs(proc_amount - internal_amount) > 0.01:
+                mismatches_found += 1
+                result_id = str(uuid.uuid4())
+                severity = "CRITICAL" if abs(proc_amount - internal_amount) > 1.0 else "HIGH"
+                conn.execute(
+                    """INSERT INTO reconciliation_results
+                       (id, run_id, transaction_id, internal_status, processor_raw_status,
+                        processor_normalized_status, mismatch_type, severity, resolved, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)""",
+                    (result_id, run_id, txn_id, internal_status,
+                     f"amount={proc_amount}", f"expected={internal_amount}",
+                     "AMOUNT_MISMATCH", severity, now),
+                )
+
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """UPDATE reconciliation_runs
+               SET completed_at = ?, total_checked = ?, mismatches_found = ?, status = 'COMPLETED'
+               WHERE id = ?""",
+            (completed_at, total_checked, mismatches_found, run_id),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Reconciliation run {run_id} failed: {e}")
+        conn.execute(
+            "UPDATE reconciliation_runs SET status = 'FAILED', completed_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), run_id),
+        )
+        conn.commit()
+        raise HTTPException(status_code=500, detail=f"Reconciliation failed: {str(e)}")
 
     run = conn.execute("SELECT * FROM reconciliation_runs WHERE id = ?", (run_id,)).fetchone()
-
     return dict(run)
+
+
+def _extract_processor_amount(proc_name: str, raw_response: dict) -> float:
+    """Extract the amount in major currency units from a processor response."""
+    try:
+        if proc_name == "PayFlow":
+            # PayFlow stores amount in cents inside nested object
+            return raw_response["amount"]["value"] / 100.0
+        elif proc_name == "StripeConnect":
+            # StripeConnect stores amount in cents as flat field
+            return raw_response["amount"] / 100.0
+        elif proc_name == "LatamPay":
+            # LatamPay stores amount in major units (no conversion needed)
+            return float(raw_response["amount"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
 
 
 def resolve_mismatch(result_id: str, action: str) -> dict:
@@ -99,31 +148,34 @@ def resolve_mismatch(result_id: str, action: str) -> dict:
     ).fetchone()
 
     if result is None:
-    
-        return {"error": "Result not found"}
+        raise HTTPException(status_code=404, detail="Reconciliation result not found")
 
-    if action == "ACCEPT_PROCESSOR":
-        new_status = result["processor_normalized_status"]
-        txn_id = result["transaction_id"]
-        conn.execute(
-            "UPDATE transactions SET internal_status = ?, updated_at = ? WHERE id = ?",
-            (new_status, now, txn_id),
-        )
-        payment_id = conn.execute(
-            "SELECT payment_id FROM transactions WHERE id = ?", (txn_id,)
-        ).fetchone()["payment_id"]
-        conn.execute(
-            "UPDATE payments SET internal_status = ?, updated_at = ? WHERE id = ?",
-            (new_status, now, payment_id),
-        )
+    try:
+        if action == "ACCEPT_PROCESSOR":
+            new_status = result["processor_normalized_status"]
+            txn_id = result["transaction_id"]
+            conn.execute(
+                "UPDATE transactions SET internal_status = ?, updated_at = ? WHERE id = ?",
+                (new_status, now, txn_id),
+            )
+            payment_id = conn.execute(
+                "SELECT payment_id FROM transactions WHERE id = ?", (txn_id,)
+            ).fetchone()["payment_id"]
+            conn.execute(
+                "UPDATE payments SET internal_status = ?, updated_at = ? WHERE id = ?",
+                (new_status, now, payment_id),
+            )
 
-    conn.execute(
-        """UPDATE reconciliation_results
-           SET resolved = TRUE, resolved_at = ?, resolution_action = ?
-           WHERE id = ?""",
-        (now, action, result_id),
-    )
-    conn.commit()
+        conn.execute(
+            """UPDATE reconciliation_results
+               SET resolved = TRUE, resolved_at = ?, resolution_action = ?
+               WHERE id = ?""",
+            (now, action, result_id),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to resolve mismatch {result_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Resolution failed: {str(e)}")
 
     updated = conn.execute(
         "SELECT * FROM reconciliation_results WHERE id = ?", (result_id,)
@@ -132,7 +184,7 @@ def resolve_mismatch(result_id: str, action: str) -> dict:
     return dict(updated)
 
 
-def bulk_resolve(result_ids: list[str], action: str) -> list[dict]:
+def bulk_resolve(result_ids: list, action: str) -> list:
     results = []
     for rid in result_ids:
         r = resolve_mismatch(rid, action)
@@ -140,7 +192,7 @@ def bulk_resolve(result_ids: list[str], action: str) -> list[dict]:
     return results
 
 
-def get_runs() -> list[dict]:
+def get_runs() -> list:
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM reconciliation_runs ORDER BY started_at DESC"
@@ -149,7 +201,7 @@ def get_runs() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_run_results(run_id: str) -> list[dict]:
+def get_run_results(run_id: str) -> list:
     conn = get_connection()
     rows = conn.execute("""
         SELECT rr.*, t.processor_name, t.amount, t.currency, t.payment_id,
@@ -171,7 +223,7 @@ def get_run_results(run_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_all_unresolved_results() -> list[dict]:
+def get_all_unresolved_results() -> list:
     conn = get_connection()
     rows = conn.execute("""
         SELECT rr.*, t.processor_name, t.amount, t.currency, t.payment_id,

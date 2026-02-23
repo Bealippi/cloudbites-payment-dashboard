@@ -1,7 +1,7 @@
 import json
 import uuid
 from datetime import datetime, timezone
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 
 from database import get_connection
@@ -123,8 +123,7 @@ def get_transaction(transaction_id: str):
     ).fetchone()
 
     if row is None:
-    
-        return {"error": "Transaction not found"}
+        raise HTTPException(status_code=404, detail="Transaction not found")
 
     txn = dict(row)
 
@@ -161,19 +160,16 @@ def get_live_status(transaction_id: str):
     ).fetchone()
 
     if row is None:
-    
-        return {"error": "Transaction not found"}
+        raise HTTPException(status_code=404, detail="Transaction not found")
 
     proc_name = row["processor_name"]
     proc_txn_id = row["processor_transaction_id"]
 
     processor = get_processor(proc_name)
     if processor is None:
-    
-        return {"error": f"Unknown processor: {proc_name}"}
+        raise HTTPException(status_code=502, detail=f"Unknown processor: {proc_name}")
 
     raw_response = processor.get_transaction(proc_txn_id)
-
 
     if raw_response is None:
         return {
@@ -220,8 +216,7 @@ def reconcile_transaction(transaction_id: str):
     ).fetchone()
 
     if row is None:
-    
-        return {"error": "Transaction not found"}
+        raise HTTPException(status_code=404, detail="Transaction not found")
 
     proc_name = row["processor_name"]
     proc_txn_id = row["processor_transaction_id"]
@@ -229,8 +224,7 @@ def reconcile_transaction(transaction_id: str):
 
     processor = get_processor(proc_name)
     if processor is None:
-    
-        return {"error": f"Unknown processor: {proc_name}"}
+        raise HTTPException(status_code=502, detail=f"Unknown processor: {proc_name}")
 
     raw_response = processor.get_transaction(proc_txn_id)
 

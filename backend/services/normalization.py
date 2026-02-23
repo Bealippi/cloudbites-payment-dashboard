@@ -1,29 +1,20 @@
-from processors.payflow import PAYFLOW_STATUS_MAP
-from processors.stripeconnect import STRIPECONNECT_STATUS_MAP
-from processors.latampay import LATAMPAY_STATUS_MAP
+from processors.registry import get_processor
 
 
 def normalize_processor_status(processor_name: str, raw_response: dict) -> str:
-    if processor_name == "PayFlow":
-        raw = raw_response.get("resultCode", "Unknown")
-        return PAYFLOW_STATUS_MAP.get(raw, "ERROR")
-    elif processor_name == "StripeConnect":
-        raw = raw_response.get("status", "unknown")
-        return STRIPECONNECT_STATUS_MAP.get(raw, "ERROR")
-    elif processor_name == "LatamPay":
-        code = str(raw_response.get("status_code", "999"))
-        return LATAMPAY_STATUS_MAP.get(code, "ERROR")
-    return "ERROR"
+    """Delegates to processor's own normalize_status method — single source of truth."""
+    processor = get_processor(processor_name)
+    if processor is None:
+        return "ERROR"
+    return processor.normalize_status(raw_response)
 
 
 def extract_raw_status(processor_name: str, raw_response: dict) -> str:
-    if processor_name == "PayFlow":
-        return raw_response.get("resultCode", "Unknown")
-    elif processor_name == "StripeConnect":
-        return raw_response.get("status", "unknown")
-    elif processor_name == "LatamPay":
-        return raw_response.get("status", "UNKNOWN")
-    return "UNKNOWN"
+    """Delegates to processor's own extract_raw_status method."""
+    processor = get_processor(processor_name)
+    if processor is None:
+        return "UNKNOWN"
+    return processor.extract_raw_status(raw_response)
 
 
 def classify_mismatch(internal: str, processor: str) -> str:
@@ -45,6 +36,7 @@ SEVERITY_MAP = {
     "MISSING_AT_PROCESSOR": "CRITICAL",
     "MISSED_WEBHOOK": "HIGH",
     "UNTRACKED_REFUND": "HIGH",
+    "AMOUNT_MISMATCH": "CRITICAL",
     "STATUS_MISMATCH": "MEDIUM",
 }
 
